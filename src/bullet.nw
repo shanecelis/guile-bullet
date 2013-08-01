@@ -1,0 +1,24 @@
+
+<<file:bullet.scm>>=
+(define-module (bullet)
+  #:export (make-sim make-box
+get-position
+make-box
+make-sim
+sim-add-body
+sim-add-fixed-box
+sim-tick))
+
+(load-extension "libguile-bullet" "init_bullet")
+@
+
+<<file:bullet.cpp>>=
+#include "rigid-body-smob.h"
+#include "sim-smob.h"
+
+extern "C" void init_bullet(void) 
+{
+  init_rigid_body_type();
+  init_sim_type();
+}
+@ 

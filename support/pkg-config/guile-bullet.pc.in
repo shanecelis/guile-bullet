@@ -1,0 +1,12 @@
+prefix=@prefix@
+exec_prefix=@exec_prefix@
+libdir=@libdir@
+includedir=@includedir@
+
+Name: guile-bullet
+Description: A wrapper library for the Bullet physics engine
+URL: <homepage>
+Version: @VERSION@
+Requires: guile-2.0 bullet
+Libs: -L${libdir} -lguile-bullet @GUILE_LOG4C_CFLAGS@
+Cflags: -I${includedir} @GUILE_LOG4C_LIBS@

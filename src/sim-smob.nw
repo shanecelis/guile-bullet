@@ -1,0 +1,351 @@
+% -*- mode: Noweb; noweb-code-mode: c-mode -*-
+\subsection{Simulation SMOB}
+
+We want to be able to instantiate a physics simulator.
+
+<<test>>=
+(let ((sim (make-sim))
+      (body (make-box #(0 0 0) #(1 1 1))))
+  (sim-add-body sim body)
+  (check (get-position body) => #(0. 0. 0.))
+  (sim-tick sim)
+  (sim-tick sim)
+  ;; the object has started to fall.
+  (check-true (< (vector-ref (get-position body) 1) 0.)))
+@ 
+
+<<test>>=
+(let ((sim (make-sim)))
+  (sim-tick sim)
+  (check-true #t))
+@ 
+
+<<file:sim-smob.h>>=
+#ifndef SCM_MAGIC_SNARFER
+#include <btBulletDynamicsCommon.h>
+#include "util.h"
+#endif
+#include <libguile.h>
+
+struct sim {
+  btDynamicsWorld *world;
+  double elapsed_time;
+  btBroadphaseInterface*  broadphase;
+  btCollisionDispatcher*  dispatcher;
+  btConstraintSolver*     solver;
+  btDefaultCollisionConfiguration* collisionConfiguration;
+};
+
+SCM wrap_sim(btDynamicsWorld* world);
+
+int is_sim_p(SCM sim_smob);
+
+void init_sim_type(void);
+struct sim* unwrap_sim(SCM sim_smob);
+SCM scm_make_sim();
+@ 
+<<file:sim-smob.cpp>>=
+<<+ Preamble>>
+
+<<Includes>>
+<<State>>
+
+<<Helper Functions>>
+<<Primitives>>
+
+/* SMOB functions */
+<<Free>>
+<<Mark>>
+<<Print>>
+@ 
+<<Includes>>=
+#include "sim-smob.h"
+@ 
+<<Free>>=
+
+static size_t free_sim (SCM sim_smob)
+{
+  struct sim *sim = (struct sim *) SCM_SMOB_DATA (sim_smob);
+  mylog("sim-smob", PRI_DEBUG, "freeing sim world 0x%x", sim->world);
+  if (sim->world)
+    delete sim->world;
+  if (sim->broadphase)
+    delete sim->broadphase;
+  if (sim->dispatcher)
+    delete sim->dispatcher;
+  if (sim->solver)
+    delete sim->solver;
+  if (sim->collisionConfiguration)
+    delete sim->collisionConfiguration;
+
+  scm_gc_free (sim, sizeof (struct sim), "sim");
+  return 0;
+}
+<<Mark>>=
+
+static SCM mark_sim (SCM sim_smob)
+{
+  //fprintf(stderr, "mark_sim\n");
+  /* Mark the sim's name and update function.  */
+  struct sim *sim = (struct sim *) SCM_SMOB_DATA (sim_smob);
+     
+  //scm_gc_mark (sim->name);
+  //return (sim->contact_func); // will recurse and mark these
+     
+  return SCM_BOOL_F;
+}
+<<Print>>=
+
+static int print_sim (SCM sim_smob, SCM port, scm_print_state *pstate)
+{
+  struct sim *sim = (struct sim *) SCM_SMOB_DATA (sim_smob);
+     
+  scm_puts ("#<sim time ", port);
+  scm_display (scm_from_double(sim->elapsed_time), port);
+  scm_puts (", ", port);
+  scm_display (scm_from_double(sim->world->getNumCollisionObjects()), port);
+  scm_puts (" objects", port);
+  scm_puts (">", port);
+     
+  /* Non-zero means success. */
+  return 1;
+}
+@ XXX No longer static so it can be observed in
+\verb|rigid-body-smob.cpp|.  Not sure I like this.
+
+<<State>>=
+static scm_t_bits sim_tag;
+@ 
+<<Initialize.>>=
+void init_sim_type(void)
+{
+#ifndef SCM_MAGIC_SNARFER 
+#include "sim-smob.cpp.x" 
+#endif
+  sim_tag = scm_make_smob_type ("sim", sizeof (struct sim));
+  scm_set_smob_mark (sim_tag, mark_sim);
+  scm_set_smob_free (sim_tag, free_sim);
+  scm_set_smob_print (sim_tag, print_sim);
+}
+@ 
+<<file:sim-smob.cpp>>=
+int is_sim_p(SCM sim_smob) 
+{
+  return SCM_SMOB_PREDICATE(sim_tag, sim_smob);
+}
+SCM wrap_sim(btDynamicsWorld* btdw)
+{
+  SCM smob;
+  static int sim_count = 0;
+  struct sim *s;
+     
+  /* Step 1: Allocate the memory block.
+   */
+  s = (struct sim *)
+    scm_gc_malloc (sizeof (struct sim), "sim");
+     
+  /* Step 2: Initialize it with straight code.
+   */
+  s->world = btdw;
+  s->broadphase = NULL;
+  s->dispatcher = NULL;
+  s->solver = NULL;
+  s->collisionConfiguration = NULL;
+
+  /* Step 3: Create the smob.
+   */
+  SCM_NEWSMOB (smob, sim_tag, s);
+  s->world->setWorldUserInfo(smob);
+  return smob;  
+}
+<<file:sim-smob.cpp>>=
+
+struct sim* unwrap_sim(SCM sim_smob)
+{
+  scm_assert_smob_type(sim_tag, sim_smob);
+  return (struct sim*) SCM_SMOB_DATA(sim_smob);
+}
+@ %def unwrap_sim
+Now lets allow ourselves to create this C object from Scheme.
+
+<<Includes>>=
+//#include "physics.h"
+#include "rigid-body-smob.h"
+#include <libguile.h>
+#include "logging.h"
+@ 
+
+<<file:sim-smob.cpp>>=
+SCM_DEFINE (scm_make_sim, "make-sim", 0, 0, 0,
+            (),
+            "Make a physics simulation.")
+{
+  btDynamicsWorld* world;
+  btBroadphaseInterface*  m_broadphase;
+  btCollisionDispatcher*  m_dispatcher;
+  btConstraintSolver*     m_solver;
+  btDefaultCollisionConfiguration* m_collisionConfiguration;
+
+  m_collisionConfiguration = new btDefaultCollisionConfiguration();
+  scm_gc_register_allocation(sizeof(*m_collisionConfiguration));
+  m_dispatcher = new btCollisionDispatcher(m_collisionConfiguration);
+  scm_gc_register_allocation(sizeof(*m_dispatcher));
+  btVector3 worldAabbMin(-10000,-10000,-10000);
+  btVector3 worldAabbMax(10000,10000,10000);
+  m_broadphase = new btAxisSweep3 (worldAabbMin, worldAabbMax);
+  scm_gc_register_allocation(sizeof(*m_broadphase));
+  m_solver = new btSequentialImpulseConstraintSolver;
+  scm_gc_register_allocation(sizeof(*m_solver));
+  world = new btDiscreteDynamicsWorld(m_dispatcher,
+                                      m_broadphase,
+                                      m_solver,
+                                      m_collisionConfiguration);
+  scm_gc_register_allocation(sizeof(*world));
+
+
+  mylog("sim-smob", PRI_DEBUG, "Making sim 0x%x", world);
+  SCM smob = wrap_sim(world);
+  struct sim* sim = unwrap_sim(smob);
+  sim->broadphase = m_broadphase;
+  sim->dispatcher = m_dispatcher;
+  sim->solver = m_solver;
+  sim->collisionConfiguration = m_collisionConfiguration;
+  return smob;
+}
+@ 
+
+<<Primitives>>=
+SCM_DEFINE (scm_sim_tick, "sim-tick", 1, 2, 0,
+            (SCM sim, SCM time_step, SCM scm_step_count),
+            "Simulate physics for one time step.")
+{
+  scm_assert_smob_type(sim_tag, sim);
+  struct sim *s = (struct sim*) SCM_SMOB_DATA(sim);
+  btScalar dt = SCM_UNBNDP(time_step) 
+    ? DEFAULT_TIME_STEP 
+    : scm_to_double(time_step);
+  int count = SCM_UNBNDP(scm_step_count) 
+    ? 1
+    : scm_to_int(scm_step_count);
+  
+  if (s->world) {
+    for (int i = 0; i < count; i++) {
+      s->world->stepSimulation(dt, 0, dt);
+      s->elapsed_time += dt;
+    }
+  }
+  return scm_from_double(s->elapsed_time);
+  scm_remember_upto_here_1 (sim);
+}
+@ 
+<<Primitives>>=
+SCM_DEFINE (scm_sim_time, "sim-time", 1, 0, 0,
+            (SCM sim),
+            "Return the elapsed time.")
+{
+  scm_assert_smob_type(sim_tag, sim);
+  struct sim *s = (struct sim*) SCM_SMOB_DATA(sim);
+  return scm_from_double(s->elapsed_time);
+}
+@ 
+
+<<Primitives>>=
+SCM_DEFINE (scm_sim_time_set_x, "sim-time-set!", 2, 0, 0,
+            (SCM sim, SCM value),
+            "Set the elapsed time.")
+{
+  scm_assert_smob_type(sim_tag, sim);
+  struct sim *s = (struct sim*) SCM_SMOB_DATA(sim);
+  s->elapsed_time = scm_to_double(value);
+  return SCM_UNSPECIFIED;
+}
+@ Just a stop gap measure.
+
+<<Primitives>>=
+SCM_DEFINE (scm_sim_add_fixed_box, "sim-add-fixed-box", 3, 1, 0,
+            (SCM sim, SCM pos, SCM dims, SCM friction),
+            "Add a fixed box to the simulation.  It will not move.")
+{
+  btCollisionShape* groundShape;
+  btCollisionObject* fixedGround;
+  struct sim *s;
+  scm_assert_smob_type(sim_tag, sim);
+  s = (struct sim*) SCM_SMOB_DATA(sim);
+  groundShape = new btBoxShape(0.5 *vector_to_btVector3(dims));
+  groundShape->setUserPointer(NULL);
+  btTransform groundTransform;
+  groundTransform.setIdentity();
+  groundTransform.setOrigin(vector_to_btVector3(pos));
+
+  fixedGround = new btCollisionObject();
+  fixedGround->setCollisionShape(groundShape);
+  fixedGround->setWorldTransform(groundTransform);
+  if (! SCM_UNBNDP(friction))
+    fixedGround->setFriction(scm_to_double(friction));
+  s->world->addCollisionObject(fixedGround);
+  return SCM_BOOL_T;
+}
+@ 
+
+<<test>>=
+(let ((sim (make-sim)))
+  (sim-tick sim)
+  (check-true #t)
+  (sim-add-fixed-box sim #(0. 0. 0.) #(1. 1. 1.))
+  (sim-tick sim)
+  (check-true #t)
+  (sim-add-fixed-box sim #(2. 2. 0.) #(1. 1. 1.))
+  (sim-tick sim)
+  (check-true #t)
+  (sim-add-fixed-box sim #(2. 2. 0.) #(1. 1. 1.))
+  (sim-tick sim)
+  (check-true #t)
+; (check (format #f "~a" sim) => "")
+)
+@ 
+
+
+<<Primitives>>=
+SCM_DEFINE (scm_sim_add_ground_plane, "sim-add-ground-plane", 1, 0, 0,
+            (SCM sim),
+            "Add a fixed box to the simulation.  It will not move.")
+{
+  btCollisionShape* groundShape;
+  btCollisionObject* fixedGround;
+  struct sim *s;
+  scm_assert_smob_type(sim_tag, sim);
+  s = (struct sim*) SCM_SMOB_DATA(sim);
+
+  groundShape = 
+    new btBoxShape(btVector3((200.),(10.),(200.)));
+  groundShape->setUserPointer(NULL);
+  btTransform groundTransform;
+  groundTransform.setIdentity();
+  groundTransform.setOrigin(btVector3(0.,-10.,0.));
+
+  fixedGround = new btCollisionObject();
+  fixedGround->setCollisionShape(groundShape);
+  fixedGround->setWorldTransform(groundTransform);
+  s->world->addCollisionObject(fixedGround);
+  return SCM_BOOL_T;
+}
+@
+<<file:sim-smob.cpp>>=
+
+<<Initialize.>>
+<<+ Include submodules.>>=
+
+#include "sim-smob.h"
+<<+ Initialize submodules.>>=
+
+init_sim_type();
+@
+
+<<file:sim-smob-test.scm>>=
+;; sim-smob-test.scm
+(use-modules 
+ (check) 
+ (bullet))
+<<test>>
+(check-exit)
+@

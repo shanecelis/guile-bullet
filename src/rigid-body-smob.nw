@@ -1,0 +1,995 @@
+% -*- mode: Noweb; noweb-code-mode: c-mode -*-
+\subsection{Rigid Body SMOB}
+
+SMOBs are simple objects that GNU Guile uses to wrap \verb|C/C++|
+objects into something that is Scheme friendly.  SMOBs are garbage
+collected.  We'll define two types of SMOBs: rigid body, and
+constraint (or joint).  
+
+<<file:rigid-body-smob.h>>=
+#ifndef SCM_MAGIC_SNARFER
+#include <btBulletDynamicsCommon.h>
+#endif
+#include <libguile.h>
+
+struct rigid_body {
+  btRigidBody *body;
+  btCollisionShape *shape;
+  btDynamicsWorld *world;
+  SCM sim;
+  SCM name;
+  SCM contact_func;
+};
+
+SCM wrap_rigid_body(btRigidBody* rb, char *name, SCM contact_func);
+struct rigid_body* wrap_rigid_body(SCM rb_smob);
+
+void call_contact_func(SCM smob);
+void init_rigid_body_type(void);
+btVector3 vector_to_btVector3(SCM vector);
+
+@ %def rigid_body
+
+Although [[vector_to_btVector3]] is implemented here.  It should be
+pulled out into a util.cpp file.
+
+<<file:rigid-body-smob.cpp>>=
+
+<<+ Preamble>>
+
+<<Includes>>
+
+<<State>>
+
+<<Helper Functions>>
+
+<<Add rigid body to simulation.>>
+<<Remove rigid body from simulation.>>
+/* SMOB functions */
+<<Free>>
+<<Mark>>
+<<Print>>
+
+<<Primitive>>
+
+// We need the initialization to come last because of the SNARFing.
+<<Initialize.>>
+@ All SMOBs must implement three functions: \verb|free|, \verb|mark| ,
+and \verb|print|.
+
+<<Free>>=
+
+static size_t free_rigid_body (SCM rigid_body_smob)
+{
+  struct rigid_body *rigid_body;
+  rigid_body = (struct rigid_body *) SCM_SMOB_DATA (rigid_body_smob);
+  mylog("rigid-body-smob", PRI_DEBUG, "freeing rigid-body 0x%x '%s'", rigid_body, scm_to_locale_string(rigid_body->name));
+  if (rigid_body->body) {
+    if (! scm_is_false(rigid_body->sim)) {
+      scm_sim_remove_body(rigid_body->sim, rigid_body_smob);
+    }
+    /* if (rigid_body->world) { */
+    /*   rigid_body->world->removeRigidBody(rigid_body->body);     */
+    /*   rigid_body->world = NULL; */
+    /* } */
+    delete rigid_body->body;
+    rigid_body->body = NULL;
+  }
+  scm_gc_free (rigid_body, sizeof (struct rigid_body), "rigid_body");
+  return 0;
+}
+@ We want to mark all the living objects so that they will not be
+garbage collected.  This will be called often for objects that are
+live.
+
+<<Mark>>=
+
+static SCM mark_rigid_body (SCM rigid_body_smob)
+{
+  /* Mark the rigid_body's name and update function.  */
+  struct rigid_body *rigid_body;
+  rigid_body = (struct rigid_body *) SCM_SMOB_DATA (rigid_body_smob);
+     
+  scm_gc_mark (rigid_body->name);
+  scm_gc_mark (rigid_body->sim);
+  return (rigid_body->contact_func); // will recurse and mark these
+     
+  //return SCM_BOOL_F;
+}
+@ When the smob is printed to string, say on the REPL, it will use
+whatever this function produces.  The convention for non-readable
+objects is to format it as \verb|#<smob-name other details...>#|.
+
+<<Print>>=
+
+static int print_rigid_body (SCM rigid_body_smob, SCM port, scm_print_state *pstate)
+{
+  struct rigid_body *rigid_body = (struct rigid_body *) SCM_SMOB_DATA (rigid_body_smob);
+     
+  scm_puts ("#<rigid_body ", port);
+  scm_display (rigid_body->name, port);
+  scm_puts (">", port);
+     
+  /* Non-zero means success. */
+  return 1;
+}
+@ Let's register this new SMOB type and its associated functions with
+Guile.  That requires we keep a ``tag'' to identify our SMOB from
+others.
+
+<<State>>=
+
+static scm_t_bits rigid_body_tag;
+<<Initialize.>>=
+
+void init_rigid_body_type(void)
+{
+#ifndef SCM_MAGIC_SNARFER 
+#include "rigid-body-smob.cpp.x" 
+#endif
+  rigid_body_tag = scm_make_smob_type ("rigid-body", sizeof (struct rigid_body));
+  scm_set_smob_mark (rigid_body_tag, mark_rigid_body);
+  scm_set_smob_free (rigid_body_tag, free_rigid_body);
+  scm_set_smob_print (rigid_body_tag, print_rigid_body);
+  <<Register contact handler.>>
+
+}
+@ The \verb|wrap_rigid_body| procedure which will return a SMOB, which
+is an \verb|SCM| type.  This will allow one to export a C object to
+Scheme.
+
+<<Primitive>>=
+SCM wrap_rigid_body(btRigidBody* btrb, char* name, SCM contact_func)
+{
+  SCM smob;
+  static int rigid_body_count = 0;
+  struct rigid_body *rb;
+     
+  /* Step 1: Allocate the memory block.
+   */
+  rb = (struct rigid_body *)
+    scm_gc_malloc (sizeof (struct rigid_body), "rigid-body");
+     
+  /* Step 2: Initialize it with straight code.
+   */
+  rb->body = btrb;
+  rb->world = NULL;
+  rb->sim = SCM_BOOL_F;
+  //rb->body->forceActivationState(DISABLE_DEACTIVATION);
+  if (name)
+    rb->name = scm_from_locale_string(name);
+  else {
+    char body_name[80];
+    sprintf(body_name, "body-%d", rigid_body_count);
+    rb->name = scm_from_locale_string(body_name);
+  }
+  rigid_body_count++;
+  if (SCM_UNBNDP(contact_func)) {
+    rb->contact_func = SCM_BOOL_F;
+  } else {
+    rb->contact_func = contact_func;
+  }
+  /* Step 3: Create the smob.
+   */
+  SCM_NEWSMOB (smob, rigid_body_tag, rb);
+  rb->body->setUserPointer(smob);
+  mylog("rigid-body-smob", PRI_DEBUG, "wrap_rigid_body 0x%x '%s'.", rb->body, scm_to_locale_string(rb->name));
+  return smob;  
+}
+@ 
+
+<<Helper Functions>>=
+struct rigid_body* unwrap_rigid_body(SCM rb_smob)
+{
+  scm_assert_smob_type(rigid_body_tag, rb_smob);
+  return (struct rigid_body*) SCM_SMOB_DATA(rb_smob);
+}
+@ 
+
+Now let's allow ourselves to create this C object from Scheme.
+
+<<Primitive>>=
+// XXX Rename this to make-box or include a parameter for shape.
+SCM_DEFINE (scm_make_box, "make-box", 2, 3, 0,
+            (SCM pos, SCM dims, SCM mass, SCM name, SCM contact_func),
+            "Make a rigid body.")
+{
+  btTransform transform;
+  btDefaultMotionState* motionState;
+  btBoxShape *shape;
+  btVector3 local_inertia(0.,0.,0.);
+  btRigidBody *body;
+
+  transform.setIdentity(); 
+  transform.setOrigin(vector_to_btVector3(pos));
+
+  motionState = new btDefaultMotionState(transform);
+  scm_gc_register_allocation(sizeof(*motionState));
+  shape = new btBoxShape(0.5 * vector_to_btVector3(dims));
+  scm_gc_register_allocation(sizeof(*shape));
+  shape->calculateLocalInertia(SCM_UNBNDP(mass) 
+                               ? 1. : scm_to_double(mass), 
+                               local_inertia);
+  //shape->setUserPointer(&IDs[index]);
+  //shape->initializePolyhedralFeatures();
+  btRigidBody::btRigidBodyConstructionInfo 
+    con_info(SCM_UNBNDP(mass) ? 1. : scm_to_double(mass),
+          motionState, shape, local_inertia);
+
+  body = new btRigidBody(con_info);
+  scm_gc_register_allocation(sizeof(*body));
+  return wrap_rigid_body(body, 
+                         SCM_UNBNDP(name) 
+                         ? NULL 
+                         : scm_to_locale_string(name), 
+                         contact_func);
+}
+@ 
+
+<<Primitive>>=
+// XXX Rename this to make-box or include a parameter for shape.
+SCM_DEFINE (scm_make_cylinder, "make-cylinder", 2, 3, 0,
+            (SCM pos, SCM dims, /*SCM axis,*/ SCM mass, SCM name, SCM contact_func),
+            "Make a rigid body.")
+{
+  btTransform transform;
+  btDefaultMotionState* motionState;
+  btCylinderShape *shape;
+  btVector3 local_inertia(0.,0.,0.);
+  btRigidBody *body;
+
+  transform.setIdentity(); 
+  transform.setOrigin(vector_to_btVector3(pos));
+
+  motionState = new btDefaultMotionState(transform);
+  scm_gc_register_allocation(sizeof(*motionState));
+
+  // XXX One should be able to define the axis arbitrarily.
+  shape = new btCylinderShape(0.5 * vector_to_btVector3(dims));
+  
+  scm_gc_register_allocation(sizeof(*shape));
+  shape->calculateLocalInertia(SCM_UNBNDP(mass) 
+                               ? 1. : scm_to_double(mass), 
+                               local_inertia);
+  //shape->setUserPointer(&IDs[index]);
+  //shape->initializePolyhedralFeatures();
+  btRigidBody::btRigidBodyConstructionInfo 
+    con_info(SCM_UNBNDP(mass) ? 1. : scm_to_double(mass),
+          motionState, shape, local_inertia);
+
+  body = new btRigidBody(con_info);
+  scm_gc_register_allocation(sizeof(*body));
+  return wrap_rigid_body(body, 
+                         SCM_UNBNDP(name) 
+                         ? NULL 
+                         : scm_to_locale_string(name), 
+                         contact_func);
+}
+@ 
+
+Initialize the rigid body SMOB when the application starts.
+
+<<+ Include submodules.>>=
+
+#include "rigid-body-smob.h"
+<<+ Initialize submodules.>>=
+
+init_rigid_body_type();
+@ One can create a rigid body, but it doesn't do anything by itself.
+How does one add it to a physics simulation?  Let's write that next.
+
+
+When we add a body to a sim, we must take care that if both are
+garbage collected that the rigid body is collected first then the sim.
+This is handled by protecting the sim.
+<<Add rigid body to simulation.>>=
+SCM_DEFINE (scm_sim_add_body, 
+            "sim-add-body", 
+            2, 2, 0,
+            (SCM sim, SCM body, SCM group, SCM mask),
+            "Add rigid body to simulation.")
+{
+  struct sim *s = unwrap_sim(sim);
+
+  scm_assert_smob_type(rigid_body_tag, body);
+  struct rigid_body *rb = (struct rigid_body*) SCM_SMOB_DATA(body);
+  if (SCM_UNBNDP(group) || SCM_UNBNDP(mask)) {
+    s->world->addRigidBody(rb->body);
+  } else {
+    s->world->addRigidBody(rb->body, scm_to_int(group), scm_to_int(mask));
+  }
+  rb->world = s->world;
+  rb->sim = sim;
+  scm_gc_protect_object(rb->sim);
+  return SCM_BOOL_T;
+}
+@ 
+<<Remove rigid body from simulation.>>=
+SCM_DEFINE (scm_sim_remove_body, 
+            "sim-remove-body", 
+            2, 0, 0,
+            (SCM sim, SCM body),
+            "Remove rigid body from simulation.")
+{
+  struct sim *s = unwrap_sim(sim);
+  scm_assert_smob_type(rigid_body_tag, body);
+  struct rigid_body *rb = (struct rigid_body*) SCM_SMOB_DATA(body);
+  if (s->world != rb->world) {
+    mylog("rigid-body-smob", PRI_WARN, "sim-remove-body not given the same physics worlds.");
+    return SCM_BOOL_F;
+  }
+  if (s->world) {
+    mylog("rigid-body-smob", PRI_DEBUG, "removing rigid body 0x%x from world 0x%x", rb->body, s->world);
+    s->world->removeRigidBody(rb->body);
+    rb->body->getCollisionShape()->setUserPointer(NULL);
+
+    rb->world = NULL;
+    scm_gc_unprotect_object(rb->sim);
+    rb->sim = SCM_BOOL_F;
+    return SCM_BOOL_T;
+  } else {
+    mylog("rigid-body-smob", PRI_WARN, "remove requested for rigid body 0x%x that doesn't have a world.", rb->body);
+    return SCM_BOOL_F;
+  }
+  scm_remember_upto_here_2(sim, body);
+}
+
+<<Helper Functions>>=
+
+btVector3 vector_to_btVector3(SCM vector) {
+  btVector3 rgb;
+  for (int i = 0; i < 3; i++)
+    rgb[i] = scm_to_double(scm_c_vector_ref(vector, i));
+  if (scm_c_vector_length(vector) == 4)
+    rgb[3] = scm_to_double(scm_c_vector_ref(vector, 3));
+  return rgb;
+}
+<<Includes>>=
+
+#ifndef SCM_MAGIC_SNARFER
+/* Headers we don't want snarfed. */
+#include "btBulletDynamicsCommon.h"
+//#include "physics.h"
+#include "logging.h"
+#endif
+/* Headers we must have snarfed. */
+#include <libguile.h>
+#include "rigid-body-smob.h"
+#include "sim-smob.h"
+@ \subsection{Getting Center of Mass}
+
+<<Primitive>>=
+SCM_DEFINE (scm_get_position, 
+            "get-position", 
+            1, 0, 0,
+            (SCM rb_smob),
+            "Get position of body from simulation.")
+{
+  scm_assert_smob_type(rigid_body_tag, rb_smob);
+  struct rigid_body *rb = (struct rigid_body*) SCM_SMOB_DATA(rb_smob);
+  return btVector3_to_vector3(rb->body->getCenterOfMassPosition());
+}
+
+SCM_DEFINE (scm_set_position_x, 
+            "set-position!", 
+            2, 0, 0,
+            (SCM rb_smob, SCM value),
+            "Set position of body from simulation.")
+{
+  scm_assert_smob_type(rigid_body_tag, rb_smob);
+  struct rigid_body *rb = (struct rigid_body*) SCM_SMOB_DATA(rb_smob);
+  btTransform CoM = rb->body->getCenterOfMassTransform();
+  CoM.setOrigin(vector_to_btVector3(value));
+  rb->body->setCenterOfMassTransform(CoM);
+  return SCM_UNSPECIFIED;
+}
+@ 
+<<Primitive>>=
+SCM_DEFINE (scm_local_to_global_position, 
+            "local->global-position", 
+            2, 0, 0,
+            (SCM rb_smob, SCM local_pos),
+            "Get position of body from simulation.")
+{
+  scm_assert_smob_type(rigid_body_tag, rb_smob);
+  struct rigid_body *rb = (struct rigid_body*) SCM_SMOB_DATA(rb_smob);
+  btVector3 v = vector_to_btVector3(local_pos);
+  btTransform worldTransform = rb->body->getCenterOfMassTransform();
+  return btVector3_to_vector3(worldTransform * v);
+}
+<<Helper Functions>>=
+SCM btVector3_to_vector(btVector3 vector) {
+  SCM v = scm_c_make_vector(4, SCM_UNDEFINED);
+  for (int i = 0; i < 4; i++)
+    scm_vector_set_x(v, scm_from_int(i), scm_from_double(vector[i]));
+  return v;
+}
+@ 
+
+<<Primitive>>=
+SCM_DEFINE (scm_rotate_body_x, 
+            "rotate-body!", 
+            4, 0, 0,
+            (SCM rb_smob, SCM yaw, SCM pitch, SCM roll),
+            "Rotate the body.")
+{
+  struct rigid_body *rb = unwrap_rigid_body(rb_smob);
+  btTransform tr;
+  tr.setIdentity();
+  btQuaternion quat;
+  quat.setEulerZYX(scm_to_double(yaw),
+                   scm_to_double(pitch),
+                   scm_to_double(roll)); 
+  tr.setRotation(quat);
+  btTransform world_transform = rb->body->getCenterOfMassTransform();
+  rb->body->setCenterOfMassTransform(world_transform*tr);
+  
+  return SCM_UNSPECIFIED;
+}
+@ 
+
+<<Helper Functions>>=
+SCM btVector3_to_vector3(btVector3 vector) {
+  SCM v = scm_c_make_vector(3, SCM_UNDEFINED);
+  for (int i = 0; i < 3; i++)
+    scm_c_vector_set_x(v, i, scm_from_double(vector[i]));
+  return v;
+}
+@
+\subsection{Handling Collisions}
+
+<<Helper Functions>>=
+void physics_call_contact_func(SCM rigid_body_smob)
+{
+  if (rigid_body_smob 
+      && SCM_SMOB_PREDICATE(rigid_body_tag, rigid_body_smob)) {
+    scm_assert_smob_type(rigid_body_tag, rigid_body_smob);
+    struct rigid_body *rb;
+    rb = (struct rigid_body *) SCM_SMOB_DATA (rigid_body_smob);
+    if (scm_is_true(scm_procedure_p(rb->contact_func))) {
+      SCM result = scm_call_0(rb->contact_func);
+    }
+  }
+  scm_remember_upto_here_1 (rigid_body_smob);
+}
+@ 
+<<Helper Functions>>=
+bool contact_callback(btManifoldPoint& cp,
+                      void* body0, void* body1)
+{
+
+  int *ID1, *ID2;
+  btCollisionObject* o1 = static_cast<btCollisionObject*>(body0);
+  btCollisionObject* o2 = static_cast<btCollisionObject*>(body1);
+
+  if (o1->getUserPointer()) {
+    SCM rigid_body_smob = (SCM) o1->getUserPointer();
+    physics_call_contact_func(rigid_body_smob);
+  }
+
+  if (o2->getUserPointer()) {
+    SCM rigid_body_smob = (SCM) o2->getUserPointer();
+    physics_call_contact_func(rigid_body_smob);
+  }
+  return false;
+}
+@ Now, we have to register our \verb|contact_callback| with Bullet.
+Unfortunately, this is done with a global variable rather than
+attaching it to some world object.
+
+<<Register contact handler.>>=
+gContactProcessedCallback = contact_callback;
+<<Primitive>>=
+SCM_DEFINE (set_contact_func_x, 
+            "set-contact-func!", 
+            2, 0, 0,
+            (SCM rigid_body_smob, SCM func),
+            "Set the contact function for a rigid body.")
+{
+  struct rigid_body *rb;
+  scm_assert_smob_type(rigid_body_tag, rigid_body_smob);
+  rb = (struct rigid_body *) SCM_SMOB_DATA (rigid_body_smob);
+  rb->contact_func = func;
+  return SCM_UNSPECIFIED;
+}
+@ \subsection{Constraint SMOB}
+
+In addition to rigid bodies, ERACS handles constraints, or joints, as
+SMOBs.
+
+<<file:rigid-body-smob.h>>=
+struct constraint {
+  btTypedConstraint* joint;
+  btRigidBody *bodyA;
+  btRigidBody *bodyB;
+  SCM body_a;
+  SCM body_b;
+
+  btDynamicsWorld *world;
+  SCM sim;
+
+  SCM type;
+  SCM name;
+  SCM update_func;
+  /* int active; */
+  /* double target_angle; */
+};
+
+#define DEFAULT_TIME_STEP 0.01666
+
+SCM wrap_constraint(btTypedConstraint* rb, 
+                    char *name, 
+                    char *type_label, 
+                    btRigidBody *a, 
+                    btRigidBody *b);
+
+struct constraint* unwrap_constraint(SCM joint);
+
+void init_constraint_type(void);
+<<State>>=
+
+static scm_t_bits constraint_tag;
+@ The SMOB requires three functions: \verb|free|, \verb|mark|, and
+\verb|print|.
+
+<<Free>>=
+SCM scm_sim_remove_constraint(SCM, SCM);
+
+static size_t free_constraint (SCM constraint_smob)
+{
+  struct constraint *constraint;
+  constraint = (struct constraint *) SCM_SMOB_DATA (constraint_smob);
+  mylog("rigid-body-smob", PRI_DEBUG, "freeing constraint 0x%x", constraint);
+
+  if (constraint->joint) {
+    if (constraint->world) {
+      scm_sim_remove_constraint(constraint->sim, constraint_smob);
+    }
+    scm_gc_unprotect_object(constraint->body_a);
+    if (constraint->body_b)
+      scm_gc_unprotect_object(constraint->body_b);
+
+    delete constraint->joint;
+    constraint->joint = NULL;
+  }
+  scm_gc_free (constraint, sizeof (struct constraint), "constraint");
+  return 0;
+}
+<<Mark>>=
+
+static SCM mark_constraint (SCM constraint_smob)
+{
+  //fprintf(stderr, "mark_constraint\n");
+  /* Mark the constraint's name and update function.  */
+  struct constraint *constraint;
+  constraint = (struct constraint *) SCM_SMOB_DATA (constraint_smob);
+     
+  scm_gc_mark (constraint->name);
+  scm_gc_mark (constraint->update_func);
+  scm_gc_mark (constraint->body_a);
+  scm_gc_mark (constraint->body_b);
+  return (constraint->type); // will recurse and mark these
+}
+<<Print>>=
+
+static int print_constraint (SCM constraint_smob, SCM port, scm_print_state *pstate)
+{
+  struct constraint *constraint;
+  constraint = (struct constraint *) SCM_SMOB_DATA (constraint_smob);
+     
+  scm_puts ("#<constraint ", port);
+  scm_display (constraint->name, port);
+  scm_puts (">", port);
+     
+  /* Non-zero means success. */
+  return 1;
+}
+<<Initialize.>>=
+
+void init_constraint_type(void)
+{
+  constraint_tag = scm_make_smob_type ("constraint", sizeof (struct constraint));
+  scm_set_smob_mark (constraint_tag, mark_constraint);
+  scm_set_smob_free (constraint_tag, free_constraint);
+  scm_set_smob_print (constraint_tag, print_constraint);
+}
+<<+ Initialize submodules.>>=
+
+init_constraint_type();
+@ Similar to \verb|wrap_rigid_body|, \verb|wrap_constraint| accepts a
+pointer to a constraint and creates a SMOB, which is an \verb|SCM|
+type.
+
+<<Helper Functions>>=
+SCM wrap_constraint(btTypedConstraint* bttc, 
+                    char* name, char* type_label, 
+                    btRigidBody *a, btRigidBody *b)
+{
+  static int constraint_count = 0;
+  SCM smob;
+  struct constraint *tc;
+     
+  /* Step 1: Allocate the memory block.
+   */
+  tc = (struct constraint *)
+    scm_gc_malloc (sizeof (struct constraint), "constraint");
+     
+  /* Step 2: Initialize it with straight code.
+   */
+  tc->joint = bttc;
+  tc->bodyA = a;
+  tc->bodyB = b;
+  tc->world = NULL;
+  tc->body_a = SCM_BOOL_F;
+  tc->body_b = SCM_BOOL_F;
+  tc->sim = SCM_BOOL_F;
+  if (name)
+    tc->name = scm_from_locale_string(name);
+  else {
+    char constraint_name[80];
+    sprintf(constraint_name, "constraint-%d", constraint_count);
+    tc->name = scm_from_locale_string(constraint_name);
+  }
+  constraint_count++;
+  tc->type = scm_from_locale_string(type_label);
+  
+  /* Step 3: Create the smob. */
+  SCM_NEWSMOB (smob, constraint_tag, tc);
+  // No user pointer for joint objects.
+  tc->joint->setUserConstraintPtr(smob);
+  mylog("rigid-body-smob", PRI_DEBUG, "wrapping constraint 0x%x", tc);
+         
+  return smob;  
+}
+
+struct constraint* unwrap_constraint(SCM joint)
+{
+  scm_assert_smob_type(constraint_tag, joint);
+  return (struct constraint*) SCM_SMOB_DATA(joint);
+}
+
+@ Let's write \verb|make-hinge| so one can create joints from Scheme.
+
+<<Primitive>>=
+SCM_DEFINE (make_hinge, "make-hinge", 6, 2, 0,
+            (SCM body_a, SCM body_b, 
+             SCM pos_a,  SCM pos_b, 
+             SCM axis_a, SCM axis_b, 
+             SCM name,   SCM update_func),
+            "Make a hinge constraint.")
+{
+  struct rigid_body *rb_a, *rb_b;
+  btVector3 p_a, p_b, ax_a, ax_b;
+
+  scm_assert_smob_type(rigid_body_tag, body_a);
+  rb_a = (struct rigid_body*) SCM_SMOB_DATA(body_a);
+  scm_assert_smob_type(rigid_body_tag, body_b);
+  rb_b = (struct rigid_body*) SCM_SMOB_DATA(body_b);
+
+
+  
+  p_a = vector_to_btVector3(pos_a);
+  p_b = vector_to_btVector3(pos_b);
+  ax_a = vector_to_btVector3(axis_a);
+  ax_b = vector_to_btVector3(axis_b);
+
+  btHingeConstraint *tc =
+    new btHingeConstraint(*(rb_a->body), *(rb_b->body),
+                          p_a, p_b,
+                          ax_a, ax_b, false);
+  scm_gc_register_allocation(sizeof(*tc));
+  /*
+  if (SCM_UNBNDP(update_func)) {
+    rb->update_func = SCM_BOOL_F;
+  } else {
+    rb->update_func = update_func;
+  }*/
+  /* Step 3: Create the smob.
+   */
+  SCM smob = wrap_constraint(tc,
+                             SCM_UNBNDP(name) 
+                             ? NULL 
+                             : scm_to_locale_string(name),
+                             (char *) "hinge",
+                             rb_a->body,
+                             rb_b->body);
+  
+  // We don't want to let these bodies be garbage collected before
+  // the joints have been disposed of.
+  scm_gc_protect_object(body_a);
+  scm_gc_protect_object(body_b);
+  // We need to remember them to unprotect them when this joint is freed.
+
+  struct constraint* c = unwrap_constraint(smob);
+  c->body_a = body_a;
+  c->body_b = body_b;
+
+  // XXX Add the update_function here.
+  return smob;
+}
+@ 
+
+<<Primitive>>=
+SCM_DEFINE (scm_make_slider, "make-slider", 2, 2, 0,
+            (SCM body_a, SCM axis_a,
+             SCM name,   SCM update_func),
+            "Make a slider constraint.")
+{
+  struct rigid_body *rb_a;
+  btVector3 p_a, ax_a;
+
+  rb_a = unwrap_rigid_body(body_a);
+  
+  ax_a = vector_to_btVector3(axis_a);
+
+  btTransform frame_a;
+  frame_a.setIdentity();
+
+  btSliderConstraint *sc =
+    new btSliderConstraint(*(rb_a->body),
+                           frame_a, 
+                           false);
+  scm_gc_register_allocation(sizeof(*sc));
+
+  sc->setLowerLinLimit(-100.);
+  sc->setUpperLinLimit(100.);
+  sc->setPoweredLinMotor(false);
+  sc->setPoweredAngMotor(false);
+  sc->setRestitutionDirLin(0.01);
+  /*
+  if (SCM_UNBNDP(update_func)) {
+    rb->update_func = SCM_BOOL_F;
+  } else {
+    rb->update_func = update_func;
+  }*/
+  /* Step 3: Create the smob.
+   */
+  SCM smob = wrap_constraint(sc,
+                             SCM_UNBNDP(name) 
+                             ? NULL 
+                             : scm_to_locale_string(name),
+                             (char *) "slider",
+                             rb_a->body,
+                             NULL);
+  
+  // We don't want to let these bodies be garbage collected before
+  // the joints have been disposed of.
+  scm_gc_protect_object(body_a);
+  // We need to remember them to unprotect them when this joint is freed.
+
+  struct constraint* c = unwrap_constraint(smob);
+  c->body_a = body_a;
+  c->body_b = NULL;
+
+  // XXX Add the update_function here.
+  return smob;
+}
+@ 
+
+
+We also want to be able to create a 1 DoF rotational motor joint.
+This code was informed by this
+\href{http://www.bulletphysics.org/Bullet/phpBB3/viewtopic.php?p=&f=9&t=3598}{posting}.
+Nevermind.  I can just use the hinge joint.  *Whew.*
+
+
+<<Primitive>>=
+
+SCM_DEFINE (scm_sim_add_constraint, "sim-add-constraint", 2, 0, 0,
+            (SCM sim, SCM joint),
+            "Add a constraint to the physics simulation.")
+{
+  extern btDynamicsWorld *world;
+  struct constraint* c;
+
+  struct sim *s = unwrap_sim(sim);
+
+  scm_assert_smob_type(constraint_tag, joint);
+  c = (struct constraint*) SCM_SMOB_DATA(joint);
+  
+  s->world->addConstraint(c->joint, true);
+  c->world = s->world;
+  c->sim = sim;
+  scm_gc_protect_object(sim);
+  return SCM_BOOL_T;
+}
+<<Primitive>>=
+
+SCM_DEFINE (scm_sim_remove_constraint, "sim-remove-constraint", 2, 0, 0,
+            (SCM sim, SCM joint),
+            "Remove a constraint to the physics simulation.")
+{
+  extern btDynamicsWorld *world;
+  struct constraint* c;
+
+  struct sim *s = unwrap_sim(sim);
+
+  scm_assert_smob_type(constraint_tag, joint);
+  c = (struct constraint*) SCM_SMOB_DATA(joint);
+  if (c->world != s->world) {
+    mylog("rigid-body-smob", 
+          PRI_WARN, 
+          "sim-remove-constraint: constraint world and sim world are different");
+  } 
+  if (c->joint && c->world) {
+    c->world->removeConstraint(c->joint);
+    c->world = NULL;
+    c->sim = SCM_BOOL_F;
+    scm_gc_unprotect_object(sim);
+    return SCM_BOOL_T;
+  }
+  return SCM_BOOL_F;
+}
+@ \subsection{Actuate Angular Motor}
+
+In other cases though, we want the joint to behave like a motor on a
+wheel and achieve a particular target angular velocity.
+
+<<Primitive>>=
+SCM_DEFINE (scm_actuate_angular_motor, "actuate-angular-motor", 2, 1, 0,
+            (SCM joint_smob, SCM target_velocity, SCM max_impulse),
+            "Actuate a joint.")
+{
+  struct constraint *constraint;
+  btHingeConstraint* hinge;
+  scm_assert_smob_type(constraint_tag, joint_smob);
+  constraint = (struct constraint*) SCM_SMOB_DATA(joint_smob);
+
+  if (constraint->joint->getConstraintType() != HINGE_CONSTRAINT_TYPE) 
+    // XXX should throw
+    return SCM_BOOL_F;
+  hinge = (btHingeConstraint*) constraint->joint;
+  constraint->bodyA->forceActivationState(ACTIVE_TAG);
+  constraint->bodyB->forceActivationState(ACTIVE_TAG);
+  if (scm_is_bool(target_velocity)) {
+    hinge->enableMotor(scm_is_true(target_velocity) ? true : false);
+  } else {
+    hinge->enableAngularMotor(true, 
+                              scm_to_double(target_velocity), 
+                              // XXX default_max_impulse should be defined somewhere.
+                              SCM_UNBNDP(max_impulse) 
+                              ? 1. : scm_to_double(max_impulse));
+  }
+  return SCM_BOOL_T;
+}
+@ 
+\subsection{Actuate Joint}
+We want to be able to actuate the joint.
+
+<<Primitive>>=
+SCM_DEFINE (actuate_joint, "actuate-joint", 2, 2, 0,
+            (SCM joint_smob, SCM target_angle, SCM dt, SCM max_impulse),
+            "Actuate a joint.")
+{
+  struct constraint *constraint;
+  btHingeConstraint* hinge;
+  scm_assert_smob_type(constraint_tag, joint_smob);
+  constraint = (struct constraint*) SCM_SMOB_DATA(joint_smob);
+
+  if (constraint->joint->getConstraintType() != HINGE_CONSTRAINT_TYPE) 
+    return SCM_BOOL_F;
+  hinge = (btHingeConstraint*) constraint->joint;
+  constraint->bodyA->forceActivationState(ACTIVE_TAG);
+  constraint->bodyB->forceActivationState(ACTIVE_TAG);
+  if (scm_is_bool(target_angle)) {
+    hinge->enableMotor(scm_is_true(target_angle) ? true : false);
+  } else {
+    hinge->enableMotor(true);
+    hinge->setMaxMotorImpulse(SCM_UNBNDP(max_impulse) 
+                              ? 1. : scm_to_double(max_impulse));
+    hinge->setMotorTarget(scm_to_double(target_angle), 
+                          SCM_UNBNDP(dt)
+                          ? DEFAULT_TIME_STEP : scm_to_double(dt));
+  }
+  return SCM_BOOL_T;
+}
+@ 
+
+
+\subsection{Friction}
+
+We need to be able to get and set the friction of a body.
+
+<<Primitive>>=
+SCM_DEFINE (scm_get_friction, 
+            "get-friction", 
+            1, 0, 0,
+            (SCM rb_smob),
+            "Get the friction of body from simulation.")
+{
+  scm_assert_smob_type(rigid_body_tag, rb_smob);
+  struct rigid_body *rb = (struct rigid_body*) SCM_SMOB_DATA(rb_smob);
+  return scm_from_double(rb->body->getFriction());
+}
+@ 
+
+<<Primitive>>=
+SCM_DEFINE (scm_set_friction_x, 
+            "set-friction!", 
+            2, 0, 0,
+            (SCM rb_smob, SCM value),
+            "Set the friction of body from simulation.")
+{
+  scm_assert_smob_type(rigid_body_tag, rb_smob);
+  struct rigid_body *rb = (struct rigid_body*) SCM_SMOB_DATA(rb_smob);
+  rb->body->setFriction(scm_to_double(value));
+  return SCM_UNSPECIFIED;
+}
+@ 
+
+\subsection{Velocity}
+
+We need to be able to get and set the friction of a body.
+
+<<Primitive>>=
+SCM_DEFINE (scm_get_velocity, 
+            "get-velocity", 
+            1, 0, 0,
+            (SCM rb_smob),
+            "Get the velocity of body from simulation.")
+{
+  scm_assert_smob_type(rigid_body_tag, rb_smob);
+  struct rigid_body *rb = (struct rigid_body*) SCM_SMOB_DATA(rb_smob);
+  return btVector3_to_vector(rb->body->getLinearVelocity());
+}
+@ 
+
+<<Primitive>>=
+SCM_DEFINE (scm_set_velocity_x, 
+            "set-velocity!", 
+            2, 0, 0,
+            (SCM rb_smob, SCM value),
+            "Set the velocity of body from simulation.")
+{
+  scm_assert_smob_type(rigid_body_tag, rb_smob);
+  struct rigid_body *rb = (struct rigid_body*) SCM_SMOB_DATA(rb_smob);
+  rb->body->setLinearVelocity(vector_to_btVector3(value));
+  return SCM_UNSPECIFIED;
+}
+@ 
+
+
+\subsection{Application of Deadly Force}
+
+<<Primitive>>=
+SCM_DEFINE (scm_apply_force, 
+            "apply-force", 
+            3, 0, 0,
+            (SCM rb_smob, SCM force_vector, SCM relative_position),
+            "Apply the force to body at a relative_position wrt the body.")
+{
+  scm_assert_smob_type(rigid_body_tag, rb_smob);
+  struct rigid_body *rb = (struct rigid_body*) SCM_SMOB_DATA(rb_smob);
+  btVector3 fv = vector_to_btVector3(force_vector);
+  btVector3 rp = vector_to_btVector3(relative_position);
+  rb->body->applyForce(fv, rp);
+  return SCM_UNSPECIFIED;
+}
+@ 
+
+<<Primitive>>=
+SCM_DEFINE (scm_apply_impulse, 
+            "apply-impulse", 
+            3, 0, 0,
+            (SCM rb_smob, SCM force_vector, SCM relative_position),
+            "Apply the force to body at a relative_position wrt the body.")
+{
+  scm_assert_smob_type(rigid_body_tag, rb_smob);
+  struct rigid_body *rb = (struct rigid_body*) SCM_SMOB_DATA(rb_smob);
+  btVector3 fv = vector_to_btVector3(force_vector);
+  btVector3 rp = vector_to_btVector3(relative_position);
+  rb->body->applyImpulse(fv, rp);
+  return SCM_UNSPECIFIED;
+}
+@ 
+
+\subsection{Scheme Module}
+
+<<file:rigid-body-smob.scm>>=
+(define-module (bullet)
+  #:export (print-hello))
+
+(load-extension "libguile-bullet" "init_hello_world")
+@ 
+
+
