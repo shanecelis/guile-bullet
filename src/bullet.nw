@@ -1,13 +1,39 @@
 
 <<file:bullet.scm>>=
 (define-module (bullet)
-  #:export (make-sim make-box
-get-position
-make-box
-make-sim
+  #:export (
+;; rigid-body-smob.nw
 sim-add-body
+sim-remove-body
+make-box
+make-cylinder
+get-position
+set-position!
+local->global-position
+rotate-body!
+set-contact-func!
+make-hinge
+make-slider
+sim-add-constraint
+sim-remove-constraint
+actuate-angular-motor
+actuate-joint
+get-friction
+set-friction!
+
+get-velocity
+set-velocity!
+apply-force
+apply-impulse
+
+;; sim-smob.nw
+sim-tick
+sim-time
+sim-time-set!
 sim-add-fixed-box
-sim-tick))
+sim-add-ground-plane
+make-sim
+))
 
 (load-extension "libguile-bullet" "init_bullet")
 @
