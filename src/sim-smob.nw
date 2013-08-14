@@ -23,7 +23,6 @@ We want to be able to instantiate a physics simulator.
 <<file:sim-smob.h>>=
 #ifndef SCM_MAGIC_SNARFER
 #include <btBulletDynamicsCommon.h>
-#include "util.h"
 #endif
 #include <libguile.h>
 

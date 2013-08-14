@@ -28,7 +28,7 @@ AC_SUBST(guile_snarf)
 PKG_CHECK_MODULES([GUILE], [guile-2.0])
 
 PKG_CHECK_MODULES([BULLET], [bullet])
-PKG_CHECK_MODULES([GUILE_LOG4C], [guile-log4c])
+PKG_CHECK_MODULES([GUILE_LOG4C], [guile-logging])
 
 # Checks for header files.
 AC_HEADER_STDC
