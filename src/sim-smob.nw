@@ -66,8 +66,8 @@ static size_t free_sim (SCM sim_smob)
 {
   struct sim *sim = (struct sim *) SCM_SMOB_DATA (sim_smob);
   mylog("sim-smob", PRI_DEBUG, "freeing sim world 0x%x", sim->world);
-  if (sim->world)
-    delete sim->world;
+  if (sim->world)  
+    delete sim->world;  
   if (sim->broadphase)
     delete sim->broadphase;
   if (sim->dispatcher)

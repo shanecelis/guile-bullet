@@ -58,7 +58,6 @@ pulled out into a util.cpp file.
 and \verb|print|.
 
 <<Free>>=
-
 static size_t free_rigid_body (SCM rigid_body_smob)
 {
   struct rigid_body *rigid_body;
@@ -66,16 +65,21 @@ static size_t free_rigid_body (SCM rigid_body_smob)
   mylog("rigid-body-smob", PRI_DEBUG, "freeing rigid-body 0x%x '%s'", rigid_body, scm_to_locale_string(rigid_body->name));
   if (rigid_body->body) {
     if (! scm_is_false(rigid_body->sim)) {
+      mylog("rigid-body-smob", PRI_DEBUG, "removing rigid-body from sim 0x%x", rigid_body->sim);
       scm_sim_remove_body(rigid_body->sim, rigid_body_smob);
+      // remove_body unprotects the sim
+      //scm_gc_unprotect_object(rigid_body->sim);
+      rigid_body->sim = SCM_BOOL_F;
+      rigid_body->world = NULL;
     }
-    /* if (rigid_body->world) { */
-    /*   rigid_body->world->removeRigidBody(rigid_body->body);     */
-    /*   rigid_body->world = NULL; */
-    /* } */
     delete rigid_body->body;
     rigid_body->body = NULL;
   }
-  scm_gc_free (rigid_body, sizeof (struct rigid_body), "rigid_body");
+  if (rigid_body->shape) {
+    delete rigid_body->shape;
+    rigid_body->shape = NULL;
+  }
+  scm_gc_free(rigid_body, sizeof (struct rigid_body), "rigid_body");
   return 0;
 }
 @ We want to mark all the living objects so that they will not be
@@ -300,7 +304,10 @@ SCM_DEFINE (scm_sim_add_body,
   }
   rb->world = s->world;
   rb->sim = sim;
-  scm_gc_protect_object(rb->sim);
+  // Why protect the sim? I'm keeping a reference to it.  Because
+  // I want rigid body, the leaf, to be deleted before the sim is deleted.
+  mylog("rigid-body-smob", PRI_TRACE, "sim-add-body: protecting sim 0x%x.",  rb->sim);
+  scm_gc_protect_object(rb->sim); 
   return SCM_BOOL_T;
 }
 @ 
@@ -324,6 +331,7 @@ SCM_DEFINE (scm_sim_remove_body,
     rb->body->getCollisionShape()->setUserPointer(NULL);
 
     rb->world = NULL;
+    mylog("rigid-body-smob", PRI_TRACE, "sim-remove-body: unprotecting sim 0x%x.", rb->sim);
     scm_gc_unprotect_object(rb->sim);
     rb->sim = SCM_BOOL_F;
     return SCM_BOOL_T;
@@ -538,16 +546,20 @@ SCM scm_sim_remove_constraint(SCM, SCM);
 static size_t free_constraint (SCM constraint_smob)
 {
   struct constraint *constraint;
-  constraint = (struct constraint *) SCM_SMOB_DATA (constraint_smob);
+  constraint = unwrap_constraint(constraint_smob);
   mylog("rigid-body-smob", PRI_DEBUG, "freeing constraint 0x%x", constraint);
-
+  if (! scm_is_false(constraint->body_a)) {
+    mylog("rigid-body-smob", PRI_DEBUG, "free_constraint: 0x%x unprotect body_a 0x%a", constraint, constraint->body_a);
+    scm_gc_unprotect_object(constraint->body_a);
+    }
+  if (! scm_is_false(constraint->body_b)) {
+    mylog("rigid-body-smob", PRI_DEBUG, "free_constraint: 0x%x unprotect body_b 0x%a", constraint, constraint->body_b);
+    scm_gc_unprotect_object(constraint->body_b);
+  }
   if (constraint->joint) {
     if (constraint->world) {
       scm_sim_remove_constraint(constraint->sim, constraint_smob);
     }
-    scm_gc_unprotect_object(constraint->body_a);
-    if (constraint->body_b)
-      scm_gc_unprotect_object(constraint->body_b);
 
     delete constraint->joint;
     constraint->joint = NULL;
@@ -559,15 +571,16 @@ static size_t free_constraint (SCM constraint_smob)
 
 static SCM mark_constraint (SCM constraint_smob)
 {
-  //fprintf(stderr, "mark_constraint\n");
   /* Mark the constraint's name and update function.  */
+  mylog("rigid-body-smob", PRI_DEBUG, "mark_constraint: 0x%x", constraint_smob);
   struct constraint *constraint;
-  constraint = (struct constraint *) SCM_SMOB_DATA (constraint_smob);
+  constraint = unwrap_constraint(constraint_smob);
      
   scm_gc_mark (constraint->name);
   scm_gc_mark (constraint->update_func);
   scm_gc_mark (constraint->body_a);
   scm_gc_mark (constraint->body_b);
+  scm_gc_mark (constraint->sim);
   return (constraint->type); // will recurse and mark these
 }
 <<Print>>=
@@ -575,7 +588,7 @@ static SCM mark_constraint (SCM constraint_smob)
 static int print_constraint (SCM constraint_smob, SCM port, scm_print_state *pstate)
 {
   struct constraint *constraint;
-  constraint = (struct constraint *) SCM_SMOB_DATA (constraint_smob);
+  constraint = unwrap_constraint(constraint_smob);
      
   scm_puts ("#<constraint ", port);
   scm_display (constraint->name, port);
@@ -619,10 +632,13 @@ SCM wrap_constraint(btTypedConstraint* bttc,
   tc->joint = bttc;
   tc->bodyA = a;
   tc->bodyB = b;
-  tc->world = NULL;
   tc->body_a = SCM_BOOL_F;
   tc->body_b = SCM_BOOL_F;
+
+  tc->world = NULL;
   tc->sim = SCM_BOOL_F;
+
+  tc->type = scm_from_locale_string(type_label);
   if (name)
     tc->name = scm_from_locale_string(name);
   else {
@@ -631,13 +647,12 @@ SCM wrap_constraint(btTypedConstraint* bttc,
     tc->name = scm_from_locale_string(constraint_name);
   }
   constraint_count++;
-  tc->type = scm_from_locale_string(type_label);
-  
+  tc->update_func = SCM_BOOL_F;
   /* Step 3: Create the smob. */
   SCM_NEWSMOB (smob, constraint_tag, tc);
   // No user pointer for joint objects.
   tc->joint->setUserConstraintPtr(smob);
-  mylog("rigid-body-smob", PRI_DEBUG, "wrapping constraint 0x%x", tc);
+  mylog("rigid-body-smob", PRI_DEBUG, "wrapping %s constraint 0x%x", type_label, tc);
          
   return smob;  
 }
@@ -665,8 +680,6 @@ SCM_DEFINE (make_hinge, "make-hinge", 6, 2, 0,
   rb_a = (struct rigid_body*) SCM_SMOB_DATA(body_a);
   scm_assert_smob_type(rigid_body_tag, body_b);
   rb_b = (struct rigid_body*) SCM_SMOB_DATA(body_b);
-
-
   
   p_a = vector_to_btVector3(pos_a);
   p_b = vector_to_btVector3(pos_b);
@@ -696,10 +709,11 @@ SCM_DEFINE (make_hinge, "make-hinge", 6, 2, 0,
   
   // We don't want to let these bodies be garbage collected before
   // the joints have been disposed of.
+  mylog("rigid-body-smob", PRI_DEBUG, "scm_make_hinge: 0x%x protect body_a 0x%x", smob, body_a);
   scm_gc_protect_object(body_a);
+  mylog("rigid-body-smob", PRI_DEBUG, "scm_make_hinge: 0x%x protect body_b 0x%x", smob, body_b);
   scm_gc_protect_object(body_b);
   // We need to remember them to unprotect them when this joint is freed.
-
   struct constraint* c = unwrap_constraint(smob);
   c->body_a = body_a;
   c->body_b = body_b;
@@ -759,7 +773,7 @@ SCM_DEFINE (scm_make_slider, "make-slider", 2, 2, 0,
 
   struct constraint* c = unwrap_constraint(smob);
   c->body_a = body_a;
-  c->body_b = NULL;
+  c->body_b = SCM_BOOL_F;
 
   // XXX Add the update_function here.
   return smob;
@@ -783,9 +797,7 @@ SCM_DEFINE (scm_sim_add_constraint, "sim-add-constraint", 2, 0, 0,
   struct constraint* c;
 
   struct sim *s = unwrap_sim(sim);
-
-  scm_assert_smob_type(constraint_tag, joint);
-  c = (struct constraint*) SCM_SMOB_DATA(joint);
+  c = unwrap_constraint(joint);
   
   s->world->addConstraint(c->joint, true);
   c->world = s->world;
@@ -803,15 +815,17 @@ SCM_DEFINE (scm_sim_remove_constraint, "sim-remove-constraint", 2, 0, 0,
   struct constraint* c;
 
   struct sim *s = unwrap_sim(sim);
-
-  scm_assert_smob_type(constraint_tag, joint);
-  c = (struct constraint*) SCM_SMOB_DATA(joint);
+  c = unwrap_constraint(joint);
   if (c->world != s->world) {
     mylog("rigid-body-smob", 
           PRI_WARN, 
           "sim-remove-constraint: constraint world and sim world are different");
   } 
   if (c->joint && c->world) {
+    mylog("rigid-body-smob", 
+          PRI_DEBUG, 
+          "sim-remove-constraint: removing constraint (unprotect sim 0x%x)", sim);
+
     c->world->removeConstraint(c->joint);
     c->world = NULL;
     c->sim = SCM_BOOL_F;
@@ -832,8 +846,7 @@ SCM_DEFINE (scm_actuate_angular_motor, "actuate-angular-motor", 2, 1, 0,
 {
   struct constraint *constraint;
   btHingeConstraint* hinge;
-  scm_assert_smob_type(constraint_tag, joint_smob);
-  constraint = (struct constraint*) SCM_SMOB_DATA(joint_smob);
+  constraint = unwrap_constraint(joint_smob);
 
   if (constraint->joint->getConstraintType() != HINGE_CONSTRAINT_TYPE) 
     // XXX should throw
@@ -863,8 +876,7 @@ SCM_DEFINE (actuate_joint, "actuate-joint", 2, 2, 0,
 {
   struct constraint *constraint;
   btHingeConstraint* hinge;
-  scm_assert_smob_type(constraint_tag, joint_smob);
-  constraint = (struct constraint*) SCM_SMOB_DATA(joint_smob);
+  constraint = unwrap_constraint(joint_smob);
 
   if (constraint->joint->getConstraintType() != HINGE_CONSTRAINT_TYPE) 
     return SCM_BOOL_F;
